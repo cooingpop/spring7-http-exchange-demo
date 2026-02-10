@@ -6,9 +6,9 @@ Spring Framework 7 / Spring Boot 4.0 에서 새롭게 도입된 **선언적 HTTP
 
 - **Zero-Config Bean Registration** — `@ImportHttpServices`로 수동 ProxyFactory/Bean 설정 없이 HTTP 클라이언트 자동 등록
 - **Declarative HTTP Interface** — `@HttpExchange` 기반 인터페이스 선언만으로 REST API 호출
-- **Adapter Pattern (Hexagonal)** — `RestClient` / `WebClient` 전환 시 Interface와 Controller 수정 불필요
-- **Multi-Service Groups** — 서비스별 독립적인 base URL, timeout, 헤더 설정
-- **Java 21 Virtual Threads** ready
+- **Hybrid Engine** — RestClient(동기) + WebClient(비동기) 한 프로젝트에서 공존
+- **Multi-Service Groups** — 서비스별 독립적인 base URL, timeout, 헤더, 필터 설정
+- **YML + Java DSL Hybrid** — 변하는 데이터는 YML에, 변하지 않는 로직은 Java에
 
 ## 기술 스택
 
@@ -24,119 +24,133 @@ Spring Framework 7 / Spring Boot 4.0 에서 새롭게 도입된 **선언적 HTTP
 
 ```
 src/main/java/com/example/httptest/
-├── HttpTestApplication.java                    # 메인 애플리케이션
+├── HttpTestApplication.java
 ├── adapter/
 │   ├── in/web/
-│   │   └── DemoController.java                 # Inbound Adapter (REST 컨트롤러)
+│   │   └── DemoController.java                    # Inbound Adapter
 │   └── out/http/
 │       ├── client/
-│       │   ├── JsonPlaceholderClient.java       # Port — @HttpExchange 스펙 (엔진 무관)
-│       │   └── DummyJsonClient.java             # Port — 두 번째 외부 서비스
+│       │   ├── JsonPlaceholderClient.java          # 동기 — RestClient
+│       │   ├── DummyJsonClient.java                # 동기 — RestClient (다른 base URL)
+│       │   └── JsonPlaceholderAsyncClient.java     # 비동기 — WebClient (Mono/Flux)
 │       ├── config/
-│       │   └── HttpClientConfig.java            # Adapter — 엔진 바인딩 + 그룹 설정
+│       │   └── HttpClientConfig.java               # 엔진 바인딩 + 그룹 설정
 │       └── dto/
-│           ├── PostDto.java                     # 외부 API 응답 DTO
-│           └── ProductDto.java                  # 외부 API 응답 DTO
+│           ├── PostDto.java
+│           ├── ProductDto.java
+│           └── CommentDto.java
 ```
 
-### 아키텍처 흐름
+---
 
-```
-[클라이언트 요청]
-    ↓
-DemoController (Inbound Adapter)
-    ↓ 인터페이스만 의존 (엔진 모름)
-JsonPlaceholderClient / DummyJsonClient (Port = 순수 스펙)
-    ↓ Spring 프록시가 실제 HTTP 호출 수행
-RestClient 또는 WebClient (Outbound Adapter = 엔진)
-    ↓
-[외부 API 서버]
-```
+## 이 설정의 진짜 가치
 
-## 핵심 코드 설명
+> "엔진(RestClient/WebClient) 교체가 쉬워진다"는 이론적 이점이지만,
+> 실무에서 이 구조가 주는 **진짜 가치**는 다른 곳에 있다.
 
-### 1. 선언적 HTTP 인터페이스 — Port (엔진 무관)
+### 1. 외부 API 스펙의 선언적 명세
 
 ```java
 @HttpExchange("/posts")
 public interface JsonPlaceholderClient {
-
-    @GetExchange
-    List<PostDto> getAll();
-
     @GetExchange("/{id}")
     PostDto getById(@PathVariable("id") Long id);
 }
 ```
 
-- 순수한 **스펙(Specification)** — RestClient/WebClient 코드가 전혀 없음
-- 엔진을 교체해도 이 파일은 수정하지 않음
+- 인터페이스만 보면 **어떤 API를 어떻게 호출하는지** 즉시 파악 가능
+- HTTP 라이브러리 코드(RestTemplate, WebClient.create() 등)가 비즈니스 로직에 섞이지 않음
+- 외부 API 문서와 1:1 대응되는 코드 = **살아있는 API 명세서**
 
-### 2. `@ImportHttpServices` — Zero-Config 등록
+### 2. 설정 중앙화 — 10개 외부 API도 한눈에
 
-```java
-@Configuration
-@ImportHttpServices(
-        group = "jsonplaceholder",
-        types = JsonPlaceholderClient.class,
-        clientType = HttpServiceGroup.ClientType.REST_CLIENT
-)
-@ImportHttpServices(
-        group = "dummyjson",
-        types = DummyJsonClient.class,
-        clientType = HttpServiceGroup.ClientType.REST_CLIENT
-)
-public class HttpClientConfig { ... }
+```yaml
+spring:
+  http:
+    serviceclient:
+      jsonplaceholder:
+        base-url: https://jsonplaceholder.typicode.com
+      dummyjson:
+        base-url: https://dummyjson.com
+      async-comments:
+        base-url: https://jsonplaceholder.typicode.com
 ```
 
-| 속성 | 역할 |
-|------|------|
-| `group` | 논리적 서비스 그룹 이름. 같은 그룹은 동일한 RestClient 인스턴스를 공유 |
-| `types` | 이 그룹에 포함할 `@HttpExchange` 인터페이스. Spring이 프록시를 생성하여 Bean 등록 |
-| `clientType` | 엔진 선택: `REST_CLIENT` (기본) 또는 `WEB_CLIENT` |
+- URL, timeout, 인증 정보가 **한 파일에 모여 있음**
+- 프로파일(dev/staging/prod)별 전환 시 **Java 코드 수정 없이 yml만 변경**
+- 서비스가 10개, 20개로 늘어나도 같은 패턴 반복
 
-기존 Spring 6의 `HttpServiceProxyFactory` + `RestClient.builder()` 보일러플레이트가 이 어노테이션 하나로 대체됨.
-
-### 3. `RestClientHttpServiceGroupConfigurer` — Adapter (엔진 설정)
+### 3. 테스트 용이성
 
 ```java
-@Bean
-RestClientHttpServiceGroupConfigurer httpServiceGroupConfigurer() {
-    return groups -> {
-        groups.filterByName("jsonplaceholder")
-                .forEachClient((group, clientBuilder) ->
-                        clientBuilder
-                                .baseUrl("https://jsonplaceholder.typicode.com")
-                                .defaultHeader("Accept", "application/json"));
+// 외부 API 호출 없이 단위 테스트 가능
+@MockitoBean
+private JsonPlaceholderClient mockClient;
 
-        groups.filterByName("dummyjson")
-                .forEachClient((group, clientBuilder) ->
-                        clientBuilder
-                                .baseUrl("https://dummyjson.com")
-                                .defaultHeader("Accept", "application/json"));
-    };
+@Test
+void testGetPost() {
+    given(mockClient.getById(1L)).willReturn(new PostDto(1L, 1L, "title", "body"));
+    // ...
 }
 ```
 
-- 그룹별로 **서로 다른 base URL**, 헤더, 인터셉터 등을 설정
-- `application.yml`의 `spring.http.serviceclient.<group>.base-url`로도 설정 가능
+- `@HttpExchange` 인터페이스를 Mock하면 **외부 네트워크 없이** 테스트 가능
+- 통합 테스트에서는 WireMock + yml의 base-url만 교체하면 됨
 
-### 4. 엔진 전환 방법 (RestClient → WebClient)
+### 4. 그룹별 독립 설정 (필터, 인증, timeout)
 
-**변경이 필요한 곳: `HttpClientConfig.java` 단 1개 파일**
+```java
+// WebClient 그룹에만 로깅 필터 적용
+groups.filterByName("async-comments")
+    .forEachClient((group, builder) ->
+        builder.filter(logRequestFilter())
+               .filter(logResponseFilter()));
+```
 
-| 변경 항목 | Before | After |
-|-----------|--------|-------|
-| `clientType` | `REST_CLIENT` | `WEB_CLIENT` |
-| Configurer 타입 | `RestClientHttpServiceGroupConfigurer` | `WebClientHttpServiceGroupConfigurer` |
-| Builder 타입 | `RestClient.Builder` | `WebClient.Builder` |
+- 특정 외부 API에만 **OAuth2 인증**, **로깅 필터**, **재시도 정책** 등을 적용
+- 다른 그룹에 영향 없음
 
-**변경하지 않는 곳:**
-- `@HttpExchange` 인터페이스 — 그대로
-- `DemoController` — 그대로
-- DTO — 그대로
+### 5. Spring 6 대비 보일러플레이트 제거
 
-이것이 **Adapter Pattern**의 핵심: 엔진 교체가 Config 한 곳에서만 발생.
+| Spring 6 (기존) | Spring 7 (신규) |
+|-----------------|-----------------|
+| `RestClient.builder().baseUrl(...)` | `application.yml` 한 줄 |
+| `HttpServiceProxyFactory.builderFor(adapter).build()` | `@ImportHttpServices` 한 줄 |
+| `proxyFactory.createClient(MyClient.class)` | 자동 Bean 등록 |
+| 서비스마다 `@Bean` 메서드 반복 | `types = {A.class, B.class}` |
+
+서비스 5개만 되어도 기존 방식은 **50줄 이상의 Config 코드**가 필요했으나,
+Spring 7에서는 **어노테이션 5줄 + yml 10줄**로 끝남.
+
+### 6. 엔진 교체에 대한 현실적 판단
+
+| 상황 | 권장 |
+|------|------|
+| Spring MVC 프로젝트 | **RestClient 통일** (동기) |
+| Spring WebFlux 프로젝트 | **WebClient 통일** (비동기) |
+| 대부분 동기 + 일부 고지연 API | **하이브리드** (이 프로젝트처럼) |
+
+> 엔진 교체 자체는 드문 일이다.
+> 하지만 **"교체할 수 있는 구조"로 설계하면, 교체하지 않더라도 코드가 깔끔해진다.**
+> 이것이 Adapter Pattern의 본질이다.
+
+---
+
+## 그룹 구성
+
+| 그룹 | 엔진 | 방식 | 외부 API |
+|------|------|------|----------|
+| `jsonplaceholder` | RestClient | 동기 | jsonplaceholder.typicode.com/posts |
+| `dummyjson` | RestClient | 동기 | dummyjson.com/products |
+| `async-comments` | WebClient | 비동기 | jsonplaceholder.typicode.com/comments |
+
+## 설정 전략: YML + Java DSL
+
+| 설정 위치 | 역할 | 예시 |
+|-----------|------|------|
+| `application.yml` | 변하는 데이터 | base-url, read-timeout |
+| Java Configurer | 변하지 않는 로직 | 로깅 필터, OAuth2, 커스텀 헤더 |
+| `@Value` | 둘을 연결 | YML 값 → Java Configurer 참조 |
 
 ## 실행 방법
 
@@ -147,38 +161,49 @@ RestClientHttpServiceGroupConfigurer httpServiceGroupConfigurer() {
 ## API 테스트
 
 ```bash
-# JSONPlaceholder — 단일 포스트 조회
-curl http://localhost:8080/posts/1
+# ── 동기 (RestClient) ────────────────────────
+curl http://localhost:8080/posts/1          # JSONPlaceholder 포스트
+curl http://localhost:8080/posts            # 전체 포스트
+curl http://localhost:8080/products/1       # DummyJSON 상품
 
-# JSONPlaceholder — 전체 포스트 조회
-curl http://localhost:8080/posts
-
-# DummyJSON — 단일 상품 조회
-curl http://localhost:8080/products/1
+# ── 비동기 (WebClient) ───────────────────────
+curl http://localhost:8080/comments/1       # 비동기 댓글 (로깅 필터 동작)
+curl http://localhost:8080/comments         # 전체 댓글 (Flux 스트림)
 ```
 
 ### 응답 예시
 
-**POST /posts/1**
+**GET /posts/1** (동기/RestClient)
 ```json
 {
-  "id": 1,
-  "userId": 1,
-  "title": "sunt aut facere repellat provident occaecati excepturi optio reprehenderit",
+  "id": 1, "userId": 1,
+  "title": "sunt aut facere repellat provident...",
   "body": "quia et suscipit..."
 }
 ```
 
-**GET /products/1**
+**GET /products/1** (동기/RestClient)
 ```json
 {
-  "id": 1,
-  "title": "Essence Mascara Lash Princess",
-  "description": "The Essence Mascara Lash Princess is a popular mascara...",
-  "price": 9.99,
-  "brand": "Essence",
-  "category": "beauty"
+  "id": 1, "title": "Essence Mascara Lash Princess",
+  "price": 9.99, "brand": "Essence", "category": "beauty"
 }
+```
+
+**GET /comments/1** (비동기/WebClient — 서버 로그에 필터 출력)
+```json
+{
+  "id": 1, "postId": 1,
+  "name": "id labore ex et quam laborum",
+  "email": "Eliseo@gardner.biz",
+  "body": "laudantium enim quasi est quidem..."
+}
+```
+
+```
+# 서버 로그 출력
+[WebClient Request] GET https://jsonplaceholder.typicode.com/comments/1
+[WebClient Response] Status: 200 OK
 ```
 
 ## Spring 6 vs Spring 7 비교
@@ -186,10 +211,11 @@ curl http://localhost:8080/products/1
 | 항목 | Spring 6 (기존) | Spring 7 (신규) |
 |------|-----------------|-----------------|
 | 클라이언트 등록 | `HttpServiceProxyFactory` 수동 설정 | `@ImportHttpServices` 자동 등록 |
-| Base URL 설정 | `RestClient.builder().baseUrl(...)` 직접 지정 | Configurer 또는 `application.yml` |
+| Base URL 설정 | `RestClient.builder().baseUrl(...)` | YML + Configurer |
 | 그룹 관리 | 불가 (개별 빈 설정) | `group` 속성으로 논리적 그룹화 |
-| 멀티 서비스 | 서비스마다 Bean 메서드 작성 | `@ImportHttpServices` 반복 선언 |
-| 엔진 전환 | 전면 코드 수정 필요 | Config 1개 파일만 수정 |
+| 멀티 서비스 | 서비스마다 Bean 메서드 | `@ImportHttpServices` 반복 선언 |
+| 동기/비동기 공존 | 완전히 다른 설정 코드 | `clientType` 속성만 변경 |
+| 필터/인터셉터 | 각 Bean에 개별 적용 | Configurer에서 그룹별 적용 |
 
 ## 참고 자료
 

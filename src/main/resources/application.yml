@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: spring7-http-client-demo
+
+  # ──────────────────────────────────────────────────────────
+  # HTTP 서비스 클라이언트 그룹별 설정
+  # - 그룹 이름은 @ImportHttpServices(group = "xxx") 과 매칭
+  # - Configurer Bean에서도 동일 설정 가능 (Configurer가 우선)
+  # ──────────────────────────────────────────────────────────
+  http:
+    serviceclient:
+      jsonplaceholder:
+        base-url: https://jsonplaceholder.typicode.com
+        read-timeout: 5s
+      dummyjson:
+        base-url: https://dummyjson.com
+        read-timeout: 5s

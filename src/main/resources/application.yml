@@ -4,14 +4,24 @@ spring:
 
   # ──────────────────────────────────────────────────────────
   # HTTP 서비스 클라이언트 그룹별 설정
+  #
+  # 설계 원칙: "변하는 데이터(URL, 시간)는 YML에, 변하지 않는 로직(필터)은 Java에"
+  #
   # - 그룹 이름은 @ImportHttpServices(group = "xxx") 과 매칭
-  # - Configurer Bean에서도 동일 설정 가능 (Configurer가 우선)
+  # - 여기서 정의한 값은 Java Configurer에서 @Value로 참조됨
+  # - 프로파일(dev/prod)별로 URL만 바꾸면 Java 코드 수정 불필요
   # ──────────────────────────────────────────────────────────
   http:
     serviceclient:
+      # ── 동기 그룹 (RestClient) ──
       jsonplaceholder:
         base-url: https://jsonplaceholder.typicode.com
         read-timeout: 5s
       dummyjson:
         base-url: https://dummyjson.com
         read-timeout: 5s
+
+      # ── 비동기 그룹 (WebClient) ──
+      async-comments:
+        base-url: https://jsonplaceholder.typicode.com
+        read-timeout: 10s

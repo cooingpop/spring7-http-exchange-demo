@@ -1,46 +1,51 @@
 package com.example.httptest.adapter.out.http.config;
 
 import com.example.httptest.adapter.out.http.client.DummyJsonClient;
+import com.example.httptest.adapter.out.http.client.JsonPlaceholderAsyncClient;
 import com.example.httptest.adapter.out.http.client.JsonPlaceholderClient;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.client.support.RestClientHttpServiceGroupConfigurer;
+import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.support.WebClientHttpServiceGroupConfigurer;
 import org.springframework.web.service.registry.HttpServiceGroup;
 import org.springframework.web.service.registry.ImportHttpServices;
+import reactor.core.publisher.Mono;
 
 /**
- * Spring 7 선언적 HTTP 클라이언트의 어댑터 설정 클래스.
+ * Spring 7 하이브리드 HTTP 클라이언트 설정 — RestClient & WebClient 공존.
  *
- * <h3>헥사고날 아키텍처에서의 역할</h3>
+ * <h3>그룹 구성</h3>
  * <pre>
- * ┌─────────────────────────────────────────────────────────┐
- * │  Interface (@HttpExchange)  =  Port (스펙, 엔진 무관)      │
- * │  이 Config 클래스            =  Adapter (엔진 바인딩)       │
- * │  Controller                 =  Inbound Adapter            │
- * └─────────────────────────────────────────────────────────┘
+ * ┌──────────────────┬────────────┬────────────────────────────────────────────┐
+ * │ 그룹              │ 엔진        │ 용도                                       │
+ * ├──────────────────┼────────────┼────────────────────────────────────────────┤
+ * │ jsonplaceholder  │ RestClient │ 동기 — Posts API                            │
+ * │ dummyjson        │ RestClient │ 동기 — Products API (다른 base URL)          │
+ * │ async-comments   │ WebClient  │ 비동기 — Comments API (Mono/Flux 반환)       │
+ * └──────────────────┴────────────┴────────────────────────────────────────────┘
  * </pre>
+ *
+ * <h3>설정 전략: YML + Java DSL 하이브리드</h3>
+ * <ul>
+ *   <li><b>변하는 데이터</b> (URL, timeout) → {@code application.yml}에 정의</li>
+ *   <li><b>변하지 않는 로직</b> (필터, 인터셉터) → Java Configurer에서 구현</li>
+ * </ul>
+ *
+ * <p>{@code @Value}로 YML 값을 주입받아 Configurer에서 참조하는 구조이며,
+ * 프로파일(dev/prod)별 URL 변경 시 Java 코드를 수정할 필요가 없다.
  *
  * <h3>{@code @ImportHttpServices} 역할</h3>
  * <ul>
- *   <li><b>group</b> — 논리적 서비스 그룹 이름. 같은 그룹의 클라이언트는
- *       동일한 RestClient(또는 WebClient) 인스턴스를 공유한다.</li>
- *   <li><b>types</b> — 이 그룹에 포함할 {@code @HttpExchange} 인터페이스 목록.
- *       Spring이 각 인터페이스의 프록시 객체를 자동 생성하여 Bean으로 등록한다.</li>
- *   <li><b>clientType</b> — 엔진 선택. {@code REST_CLIENT} 또는 {@code WEB_CLIENT}.
- *       생략 시 기본값은 {@code REST_CLIENT}.</li>
+ *   <li><b>group</b> — 논리적 서비스 그룹. 같은 그룹의 클라이언트는 동일한 HTTP 엔진 인스턴스를 공유</li>
+ *   <li><b>types</b> — Bean으로 등록할 {@code @HttpExchange} 인터페이스 목록 (프록시 자동 생성)</li>
+ *   <li><b>clientType</b> — {@code REST_CLIENT}(동기) 또는 {@code WEB_CLIENT}(비동기)</li>
  * </ul>
- *
- * <p>기존 Spring 6에서 수동으로 작성하던 {@code HttpServiceProxyFactory} +
- * {@code RestClient.builder()} 보일러플레이트가 이 어노테이션 하나로 대체된다.
- *
- * <h3>엔진 전환 방법 (RestClient → WebClient)</h3>
- * <ol>
- *   <li>{@code clientType}을 {@code HttpServiceGroup.ClientType.WEB_CLIENT}로 변경</li>
- *   <li>아래 Bean 타입을 {@code WebClientHttpServiceGroupConfigurer}로 교체</li>
- *   <li>빌더 타입이 {@code RestClient.Builder} → {@code WebClient.Builder}로 변경됨</li>
- *   <li><b>Interface, Controller 는 수정 불필요</b> — 이것이 Adapter Pattern의 핵심</li>
- * </ol>
  */
+@Slf4j
 @Configuration
 @ImportHttpServices(
         group = "jsonplaceholder",
@@ -52,38 +57,91 @@ import org.springframework.web.service.registry.ImportHttpServices;
         types = DummyJsonClient.class,
         clientType = HttpServiceGroup.ClientType.REST_CLIENT
 )
+@ImportHttpServices(
+        group = "async-comments",
+        types = JsonPlaceholderAsyncClient.class,
+        clientType = HttpServiceGroup.ClientType.WEB_CLIENT
+)
 public class HttpClientConfig {
 
+    // ──────────────────────────────────────────────────────────
+    // 동기 그룹 (RestClient) — jsonplaceholder, dummyjson
+    // ──────────────────────────────────────────────────────────
+
     /**
-     * 각 HTTP 서비스 그룹의 RestClient를 커스터마이징하는 Configurer.
+     * RestClient 그룹 Configurer.
      *
-     * <p>{@code groups.filterByName("그룹명")}으로 특정 그룹만 필터링하고,
-     * {@code forEachClient}로 해당 그룹의 {@code RestClient.Builder}를 설정한다.
-     *
-     * <p>base URL은 {@code application.yml}의
-     * {@code spring.http.serviceclient.<group>.base-url}로도 설정 가능하지만,
-     * Configurer에서 직접 설정하면 추가 헤더·인터셉터 등 세밀한 제어가 가능하다.
-     *
-     * <p><b>WebClient 전환 시:</b> 이 메서드의 반환 타입을
-     * {@code WebClientHttpServiceGroupConfigurer}로 바꾸고,
-     * {@code clientBuilder} 파라미터가 {@code WebClient.Builder}로 변경된다.
+     * <p>{@code @Value}로 YML의 base-url을 주입받아 설정한다.
+     * 헤더 등 공통 설정은 Java DSL에서 처리.
      */
     @Bean
-    RestClientHttpServiceGroupConfigurer httpServiceGroupConfigurer() {
+    RestClientHttpServiceGroupConfigurer restClientGroupConfigurer(
+            @Value("${spring.http.serviceclient.jsonplaceholder.base-url}") String jsonPlaceholderUrl,
+            @Value("${spring.http.serviceclient.dummyjson.base-url}") String dummyJsonUrl) {
+
         return groups -> {
             groups.filterByName("jsonplaceholder")
-                    .forEachClient((group, clientBuilder) ->
-                            clientBuilder
-                                    .baseUrl("https://jsonplaceholder.typicode.com")
+                    .forEachClient((group, builder) ->
+                            builder.baseUrl(jsonPlaceholderUrl)
                                     .defaultHeader("Accept", "application/json")
                     );
 
             groups.filterByName("dummyjson")
-                    .forEachClient((group, clientBuilder) ->
-                            clientBuilder
-                                    .baseUrl("https://dummyjson.com")
+                    .forEachClient((group, builder) ->
+                            builder.baseUrl(dummyJsonUrl)
                                     .defaultHeader("Accept", "application/json")
                     );
         };
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // 비동기 그룹 (WebClient) — async-comments
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * WebClient 그룹 Configurer.
+     *
+     * <p>RestClient Configurer와 구조는 동일하지만:
+     * <ul>
+     *   <li>반환 타입: {@code WebClientHttpServiceGroupConfigurer}</li>
+     *   <li>빌더 타입: {@code WebClient.Builder} (filter 메서드 사용 가능)</li>
+     *   <li>{@code ExchangeFilterFunction}으로 요청/응답 로깅 필터 추가</li>
+     * </ul>
+     */
+    @Bean
+    WebClientHttpServiceGroupConfigurer webClientGroupConfigurer(
+            @Value("${spring.http.serviceclient.async-comments.base-url}") String asyncBaseUrl) {
+
+        return groups -> groups
+                .filterByName("async-comments")
+                .forEachClient((group, builder) ->
+                        builder.baseUrl(asyncBaseUrl)
+                                .defaultHeader("Accept", "application/json")
+                                .filter(logRequestFilter())
+                                .filter(logResponseFilter())
+                );
+    }
+
+    /**
+     * WebClient 요청 로깅 필터 — Java DSL 방식.
+     *
+     * <p>YML로는 불가능한 로직(필터, 인터셉터, OAuth2 등)을
+     * Java Configurer에서 구현하는 대표적인 사례.
+     */
+    private static ExchangeFilterFunction logRequestFilter() {
+        return ExchangeFilterFunction.ofRequestProcessor(request -> {
+            log.info("[WebClient Request] {} {}", request.method(), request.url());
+            return Mono.just(request);
+        });
+    }
+
+    /**
+     * WebClient 응답 로깅 필터.
+     */
+    private static ExchangeFilterFunction logResponseFilter() {
+        return ExchangeFilterFunction.ofResponseProcessor(response -> {
+            log.info("[WebClient Response] Status: {}", response.statusCode());
+            return Mono.just(response);
+        });
     }
 }
